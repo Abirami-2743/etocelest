@@ -1,0 +1,17 @@
+[
+  {
+    "name": "Ares-9 Lunar Gateway Resupply",
+    "leadDays": 760,
+    "context": "Crewed resupply run to the Lunar Gateway station, 4-person crew, single launch window."
+  },
+  {
+    "name": "Helios-3 Solar Observer",
+    "leadDays": 870,
+    "context": "Uncrewed probe positioned near L1 to study solar wind ahead of the next activity cycle."
+  },
+  {
+    "name": "Meridian Mars Transfer Window",
+    "leadDays": 1800,
+    "context": "Cargo pre-position launch ahead of the following crewed Mars transfer window."
+  }
+]
