@@ -1,0 +1,8 @@
+node_modules/
+.env
+.venv/
+venv/
+__pycache__/
+dist/
+*.pyc
+package.json.bad

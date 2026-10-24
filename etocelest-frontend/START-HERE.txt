@@ -1,0 +1,7 @@
+node_modules is already included (built for Windows x64). Do NOT run npm install.
+
+  1. Start the backend first (see RUN.md / backend README).
+  2. In this folder run:   npm run dev
+  3. Open http://localhost:5173
+
+Needs Node 20 or newer (Node 24 is fine; the native bundler for Windows x64 is bundled).
