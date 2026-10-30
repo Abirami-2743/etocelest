@@ -1,5 +1,9 @@
 """The debate engine: four agents talk to each other round by round; the Judge always rules.
 
+Control flow (rounds, the Judge's reopen/rule decision, the round cap) is a LangGraph state graph,
+see `app.services.debate_graph`. This module supplies the work done at each node: agent and Judge
+LLM calls, event-log writes, grounding and the final ruling.
+
 Guarantee: `run()` either ends with a ruling (`done` event) or fails with an `error` event for
 a non-recoverable reason (bad API key, no agent able to respond at all). Once the round cap is
 reached the Judge is forced to rule; if even that call fails, a documented mechanical ruling
@@ -24,6 +28,15 @@ from app.domain.prompts import TurnRecord, agent_messages, brief, judge_messages
 from app.llm.groq_client import GroqClient, LLMError, LLMFatalError, Usage
 from app.llm.schemas import AgentTurn, JudgeTurn, agent_json_schema, judge_json_schema
 from app.models import Mission, MissionStatus
+from app.services.debate_graph import (
+    DebateGraphState,
+    DebateNodes,
+    Ruling,
+    RunContext,
+    build_debate_graph,
+    initial_state,
+    recursion_limit,
+)
 from app.services.notifier import Notifier
 from app.services.repository import Repository
 
@@ -80,6 +93,17 @@ class DebateEngine:
         self._grounding = grounding
         self._notifier = notifier
         self._s = settings
+        # Compiled once; holds no per-run state (that travels in `RunContext`), so it is safe to
+        # share across concurrent debates.
+        self._graph = build_debate_graph(
+            DebateNodes(
+                ground=self._node_ground,
+                agents=self._node_agents,
+                judge=self._node_judge,
+                fallback=self._node_fallback,
+                finalize=self._node_finalize,
+            )
+        )
 
     async def _emit(self, mission_id: str, etype: str, **payload: Any) -> None:
         await self._repo.append_event(mission_id, etype, payload)
@@ -102,25 +126,114 @@ class DebateEngine:
 
         stored = await self._repo.events_after(mission_id)
         state = rebuild_state([(e.type, e.payload) for e in stored])
-        grounding = await self._ensure_grounding(mission)
-        mission_brief = brief(mission.name, mission.launch_date, mission.context, mission.created_at.date())
+        ctx = RunContext(
+            mission=mission,
+            brief=brief(mission.name, mission.launch_date, mission.context, mission.created_at.date()),
+        )
+        start = initial_state(
+            max_rounds=mission.max_rounds,
+            last_round=state.last_round,
+            turns=state.turns,
+            judge_notes=state.judge_notes,
+            open_issues=state.open_issues,
+            last_positions=state.last_positions,
+            grounding=mission.grounding,
+        )
+        config = {"recursion_limit": recursion_limit(mission.max_rounds, self._s.graph_step_headroom)}
+        # EngineFailure / LLMFatalError / cancellation propagate unchanged to `DebateRunner`.
+        await self._graph.ainvoke(start, config=config, context=ctx)
 
-        if state.last_round == 0:
-            await self._emit(mission_id, ev.STATUS, value="Four agents loaded. Judge standing by.")
+    # ------------------------------------------------------------- nodes
+    async def _node_ground(self, state: DebateGraphState, ctx: RunContext) -> dict[str, Any]:
+        grounding = await self._ensure_grounding(ctx.mission)
+        if state["last_round"] == 0:
+            await self._emit(ctx.mission.id, ev.STATUS, value="Four agents loaded. Judge standing by.")
+        return {"grounding": grounding}
 
-        for r in range(state.last_round + 1, mission.max_rounds + 1):
-            if await self._play_round(mission, r, state, mission_brief, grounding):
-                return
+    async def _node_agents(self, state: DebateGraphState, ctx: RunContext) -> dict[str, Any]:
+        """Play one round: every agent speaks once, each seeing the turns before it."""
+        mission = ctx.mission
+        r = state["last_round"] + 1
+        await self._emit(mission.id, ev.ROUND_START, round=r)
 
-        # Defensive: the final round forces a ruling, so this is only reachable on resume
-        # with a changed/odd log. The Judge still concludes.
-        logger.warning("mission %s reached end of loop without ruling; issuing fallback", mission_id)
-        await self._finalize(
-            mission, mission.max_rounds, None, state.last_positions, "fallback",
-            note="The round limit was reached without a recorded ruling; the Judge's fallback rule applies.",
-            summary=None,
+        visible = list(state["turns"])  # grows as agents speak, so later speakers see earlier ones
+        new_turns: list[TurnRecord] = []
+        positions: list[Position] = []
+        for spec in speaking_order(r):
+            await self._emit(mission.id, ev.TURN_START, round=r, agent=spec.id)
+            rec = await self._agent_turn(
+                mission, spec, r, visible, state["judge_notes"], state["open_issues"],
+                ctx.brief, state["grounding"],
+            )
+            visible.append(rec)
+            new_turns.append(rec)
+            if rec.position:
+                positions.append(rec.position)
+
+        if not positions:
+            raise EngineFailure("None of the agents could respond. Please try again in a moment.")
+        return {"current_round": r, "turns": new_turns, "last_positions": positions}
+
+    async def _node_judge(self, state: DebateGraphState, ctx: RunContext) -> dict[str, Any]:
+        """The Judge either rules (-> finalize) or reopens with specific questions (-> agents)."""
+        mission = ctx.mission
+        r = state["current_round"]
+        may_rule = r >= mission.min_rounds
+        must_rule = r >= mission.max_rounds
+        await self._emit(mission.id, ev.JUDGE_EVALUATING, round=r)
+        judge = await self._judge_turn(
+            mission, r, state["turns"], state["judge_notes"], state["last_positions"],
+            ctx.brief, state["grounding"], may_rule, must_rule,
         )
 
+        if judge is not None and judge.decision == "rule":
+            return {
+                "last_round": r,
+                "ruling": Ruling(judge=judge, forced_resolution=None, note=judge.note.strip(),
+                                 summary=judge.summary.strip()),
+            }
+        if must_rule:
+            return {
+                "last_round": r,
+                "ruling": Ruling(
+                    judge=None, forced_resolution="fallback",
+                    note="The Judge model could not produce a ruling, so the Judge's fallback rule was applied.",
+                    summary=None,
+                ),
+            }
+
+        if judge is None:
+            note = "The Judge could not be reached this round; the debate continues."
+            issues: list[dict[str, str]] = []
+        else:
+            note = judge.note.strip()
+            issues = [i.model_dump() for i in judge.open_issues]
+        await self._emit(mission.id, ev.JUDGE_NOTE, round=r, resolved=False, note=note, openIssues=issues)
+        return {"last_round": r, "judge_notes": {**state["judge_notes"], r: note}, "open_issues": issues}
+
+    async def _node_fallback(self, state: DebateGraphState, ctx: RunContext) -> dict[str, Any]:
+        """Defensive: reached the round cap with no recorded ruling (e.g. a resumed, odd log)."""
+        mission = ctx.mission
+        logger.warning("mission %s reached the round cap without a ruling; issuing fallback", mission.id)
+        return {
+            "current_round": mission.max_rounds,
+            "ruling": Ruling(
+                judge=None, forced_resolution="fallback",
+                note="The round limit was reached without a recorded ruling; the Judge's fallback rule applies.",
+                summary=None,
+            ),
+        }
+
+    async def _node_finalize(self, state: DebateGraphState, ctx: RunContext) -> dict[str, Any]:
+        ruling = state["ruling"]
+        assert ruling is not None  # the router only reaches `finalize` with a ruling set
+        await self._finalize(
+            ctx.mission, state["current_round"], ruling.judge, state["last_positions"],
+            ruling.forced_resolution, note=ruling.note, summary=ruling.summary,
+        )
+        return {}
+
+    # ---------------------------------------------------------- grounding
     async def _ensure_grounding(self, mission: Mission) -> dict[str, Any] | None:
         if mission.grounding is not None:
             return mission.grounding
@@ -135,62 +248,16 @@ class DebateEngine:
             await self._emit(mission.id, ev.STATUS, value=f"No solar-cycle data for this window: {g['reason']}.")
         return g
 
-    # -------------------------------------------------------------- round
-    async def _play_round(
-        self, mission: Mission, r: int, st: DebateState, mission_brief: str, grounding: dict[str, Any] | None
-    ) -> bool:
-        """Play one round. Returns True once the Judge has ruled."""
-        mid = mission.id
-        await self._emit(mid, ev.ROUND_START, round=r)
-        positions: list[Position] = []
-
-        for spec in speaking_order(r):
-            await self._emit(mid, ev.TURN_START, round=r, agent=spec.id)
-            rec = await self._agent_turn(mission, spec, r, st, mission_brief, grounding)
-            st.turns.append(rec)
-            if rec.position:
-                positions.append(rec.position)
-
-        if not positions:
-            raise EngineFailure("None of the agents could respond. Please try again in a moment.")
-        st.last_positions = positions
-
-        may_rule = r >= mission.min_rounds
-        must_rule = r >= mission.max_rounds
-        await self._emit(mid, ev.JUDGE_EVALUATING, round=r)
-        judge = await self._judge_turn(mission, r, st, mission_brief, grounding, may_rule, must_rule)
-
-        if judge is not None and judge.decision == "rule":
-            return await self._finalize(
-                mission, r, judge, positions, None, note=judge.note.strip(), summary=judge.summary.strip()
-            )
-        if must_rule:
-            return await self._finalize(
-                mission, r, None, positions, "fallback",
-                note="The Judge model could not produce a ruling, so the Judge's fallback rule was applied.",
-                summary=None,
-            )
-
-        if judge is None:
-            note = "The Judge could not be reached this round; the debate continues."
-            issues: list[dict[str, str]] = []
-        else:
-            note = judge.note.strip()
-            issues = [i.model_dump() for i in judge.open_issues]
-        st.last_round = r
-        st.judge_notes[r] = note
-        st.open_issues = issues
-        await self._emit(mid, ev.JUDGE_NOTE, round=r, resolved=False, note=note, openIssues=issues)
-        return False
-
+    # -------------------------------------------------------------- turns
     async def _agent_turn(
-        self, mission: Mission, spec: AgentSpec, r: int, st: DebateState, mission_brief: str,
+        self, mission: Mission, spec: AgentSpec, r: int, turns: list[TurnRecord],
+        judge_notes: dict[int, str], open_issues: list[dict[str, str]], mission_brief: str,
         grounding: dict[str, Any] | None,
     ) -> TurnRecord:
         mid = mission.id
         messages = agent_messages(
-            spec, mission_brief=mission_brief, grounding=grounding, turns=st.turns,
-            judge_notes=st.judge_notes, open_issues=st.open_issues, round_number=r,
+            spec, mission_brief=mission_brief, grounding=grounding, turns=turns,
+            judge_notes=judge_notes, open_issues=open_issues, round_number=r,
             max_shift=mission.max_shift_days,
         )
         try:
@@ -219,12 +286,13 @@ class DebateEngine:
         return TurnRecord(round=r, agent=spec.id, text=turn.message, position=pos)
 
     async def _judge_turn(
-        self, mission: Mission, r: int, st: DebateState, mission_brief: str,
-        grounding: dict[str, Any] | None, may_rule: bool, must_rule: bool,
+        self, mission: Mission, r: int, turns: list[TurnRecord], judge_notes: dict[int, str],
+        latest_positions: list[Position], mission_brief: str, grounding: dict[str, Any] | None,
+        may_rule: bool, must_rule: bool,
     ) -> JudgeTurn | None:
         messages = judge_messages(
-            mission_brief=mission_brief, grounding=grounding, turns=st.turns, judge_notes=st.judge_notes,
-            latest_positions=st.last_positions, round_number=r, max_rounds=mission.max_rounds,
+            mission_brief=mission_brief, grounding=grounding, turns=turns, judge_notes=judge_notes,
+            latest_positions=latest_positions, round_number=r, max_rounds=mission.max_rounds,
             max_shift=mission.max_shift_days, may_rule=may_rule, must_rule=must_rule,
         )
         try:

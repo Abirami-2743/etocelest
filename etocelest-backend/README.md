@@ -32,6 +32,23 @@ Tests: `pip install -r requirements-dev.txt && pytest` (uses a fake Groq server;
 
 ## How a review works
 
+The debate is a [LangGraph](https://langchain-ai.github.io/langgraph/) state graph (`app/services/debate_graph.py`).
+The graph owns the control flow; `DebateEngine` (`app/services/engine.py`) supplies the work done at each node.
+
+```
+START -> ground -> agents -> judge --(objections remain)--> agents
+           |                   |
+           |                   +--(ruled, or cap reached)--> finalize -> END
+           +--(log already holds every round)--> fallback -> finalize
+```
+
+- One compiled graph is shared by all concurrent debates; per-run data (mission, brief) travels in LangGraph's
+  `context`, never in globals.
+- Durability is the persisted **event log**, not a LangGraph checkpointer: it is also what the UI's SSE replay
+  reads. A resumed run seeds the graph state from that log and continues at the next round.
+- The loop is bounded by construction (the router sends anything at the round cap to `finalize`), and the
+  LangGraph step budget is derived from the mission's `max_rounds` plus `GRAPH_STEP_HEADROOM`.
+
 1. `POST /api/missions` stores the mission and starts a background debate.
 2. Round *r*: agents speak sequentially (order rotates each round). Each sees the mission brief, grounding data,
    the full transcript so far and the Judge's open questions. Each returns a validated JSON turn: message,

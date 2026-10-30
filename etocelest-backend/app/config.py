@@ -52,6 +52,9 @@ class Settings(BaseSettings):
     max_shift_days: int = Field(default=60, ge=1, le=365)
     max_concurrent_debates: int = Field(default=2, ge=1, le=32)
     mission_timeout_seconds: float = Field(default=1800.0, gt=0)
+    # Extra LangGraph steps allowed beyond the worst-case path (2 per round + ground/fallback/finalize).
+    # The step budget is derived from the mission's max_rounds, so this only needs raising if you add nodes.
+    graph_step_headroom: int = Field(default=4, ge=0, le=100)
 
     # --- Abuse protection ------------------------------------------------
     rate_limit_missions_per_hour: int = Field(default=20, ge=1)
